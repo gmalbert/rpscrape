@@ -7,14 +7,15 @@ import sys
 from collections.abc import Callable
 from datetime import date
 from dotenv import load_dotenv
-from lxml import html
 from orjson import loads
 from pathlib import Path
 from typing import TextIO, TYPE_CHECKING
+from urllib.parse import urlencode
 
 from utils.argparser import ArgParser
 from utils.betfair import Betfair
 from utils.network import NetworkClient
+from utils.next_data import page_props, race_result
 from utils.paths import Paths, build_paths
 from utils.settings import Settings
 from utils.update import Update
@@ -57,32 +58,43 @@ def sort_key(url: str) -> tuple[str, str]:
 def get_race_urls(
     years: list[str], tracks: list[tuple[str, str]], race_type: str, client: NetworkClient
 ) -> list[str]:
-    url_course_base = 'https://www.racingpost.com:443/profile/course/filter/results'
     url_result_base = 'https://www.racingpost.com/results'
+    url_api_base = 'https://www.racingpost.com/api/course-profile/results'
 
     urls: set[str] = set()
 
     for course_id, course in tracks:
-        for year in years:
-            race_list_url = f'{url_course_base}/{course_id}/{year}/{race_type}/all-races'
+        course_slug = course.lower().replace(' ', '-').replace("'", '')
 
-            status, response = client.get(race_list_url)
+        for year in years:
+            query = urlencode(
+                {
+                    'courseId': course_id,
+                    'season': year,
+                    'raceType': race_type,
+                    'raceCategory': 'all-races',
+                }
+            )
+            url = f'{url_api_base}?{query}'
+
+            status, response = client.get(url)
 
             if status != 200:
-                print(f'Failed to get race urls.\nStatus: {status}, URL: {race_list_url}')
+                print(f'Failed to get race urls.\nStatus: {status}, URL: {url}')
                 sys.exit(1)
 
-            data = loads(response.text).get('data', {})
-            races = data.get('principleRaceResults', [])
+            rows = (
+                loads(response.content)
+                .get('results', {})
+                .get('data', {})
+                .get('principle_race_results')
+                or []
+            )
 
-            if not races:
-                continue
-
-            for race in races:
-                race_date = race['raceDatetime'][:10]
-                race_id = race['raceInstanceUid']
-                race_url = f'{url_result_base}/{course_id}/{course}/{race_date}/{race_id}'
-                urls.add(race_url.replace(' ', '-').replace("'", ''))
+            for row in rows:
+                race_date = row['race_datetime'][:10]
+                race_id = row['race_instance_uid']
+                urls.add(f'{url_result_base}/{course_id}/{course_slug}/{race_date}/{race_id}')
 
     return sorted(urls, key=sort_key)
 
@@ -97,13 +109,19 @@ def get_race_urls_date(
         url = f'https://www.racingpost.com/results/{race_date}'
 
         _, response = client.get(url)
-        doc = html.fromstring(response.content)
 
-        races = doc.xpath('//a[@data-test-selector="link-listCourseNameLink"]')
-        for race in races:
-            course_id = race.attrib['href'].split('/')[2]
-            if course_id in course_ids:
-                urls.add(f'https://www.racingpost.com{race.attrib["href"]}')
+        meetings = (
+            page_props(response.text).get('initialState', {}).get('results', {}).get('data') or []
+        )
+
+        for meeting in meetings:
+            if str(meeting.get('courseId')) not in course_ids:
+                continue
+
+            for race in meeting.get('races') or []:
+                link = race.get('fullResultLink')
+                if link:
+                    urls.add(f'https://www.racingpost.com{link}')
 
     return sorted(urls, key=sort_key)
 
@@ -149,6 +167,17 @@ def prepare_betfair(
     return betfair
 
 
+def get_race_data(url: str, client: NetworkClient, retries: int = 3) -> dict | None:
+    for _ in range(retries):
+        _, response = client.get(url)
+        data = race_result(response.text)
+
+        if data:
+            return data
+
+    return None
+
+
 def scrape_races(
     race_urls: list[str],
     paths: Paths,
@@ -181,14 +210,13 @@ def scrape_races(
             _ = f.write(settings.csv_header + '\n')
 
         for url in race_urls:
-            _, response = client.get(url)
-            doc = html.fromstring(response.content)
+            data = get_race_data(url, client)
 
             try:
                 race = (
-                    Race(client, url, doc, race_type, settings.fields, betfair.data)
+                    Race(data, settings.fields, betfair.data)
                     if betfair
-                    else Race(client, url, doc, race_type, settings.fields)
+                    else Race(data, settings.fields)
                 )
             except VoidRaceError:
                 continue

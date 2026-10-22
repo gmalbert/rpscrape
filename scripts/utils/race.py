@@ -1,26 +1,31 @@
 import sys
 
-from datetime import datetime
 from jarowinkler import jarowinkler_similarity
-from lxml import html
-from lxml.html import HtmlElement
 from re import search, sub
 
 from models.betfair import BSPMap
 from models.race import RaceInfo, RunnerInfo
-from utils.pedigree import Pedigree
 
-from utils.cleaning import clean_race, clean_string, strip_row
-from utils.date import convert_date
+from utils.cleaning import clean_race, clean_string
 from utils.going import get_surface
 from utils.lps import get_lps_scale
-from utils.lxml_funcs import find
-from utils.network import NetworkClient
 from utils.region import get_region
 
 
 regex_class = r'(\(|\s)(C|c)lass (\d|[A-Ha-h])(\)|\s)'
 regex_group = r'(\(|\s)((G|g)rade|(G|g)roup) (\d|[A-Ca-c]|I*)(\)|\s)'
+
+RACE_TYPE_CODES: dict[str, str] = {
+    'F': 'Flat',
+    'X': 'Flat',
+    'H': 'Hurdle',
+    'Y': 'Hurdle',
+    'C': 'Chase',
+    'U': 'Chase',
+    'Z': 'Chase',
+    'P': 'Chase',
+    'B': 'NH Flat',
+}
 
 
 class VoidRaceError(Exception):
@@ -30,120 +35,118 @@ class VoidRaceError(Exception):
 class Race:
     def __init__(
         self,
-        client: NetworkClient,
-        url: str,
-        document: HtmlElement,
-        race_type: str,
+        data: dict | None,
         fields: list[str],
         bsp_map: BSPMap | None = None,
     ):
-        self.url: str = url
-        self.doc: HtmlElement = document
+        if not data:
+            raise VoidRaceError('No race result data')
+
+        self.data: dict = data
         self.race_info: RaceInfo = RaceInfo()
         self.runner_info: RunnerInfo = RunnerInfo()
 
-        url_split = self.url.split('/')
-
-        date_time_info = self.doc.find('.//main[@data-analytics-race-date-time]')
-
-        while date_time_info is None:
-            _, response = client.get(self.url)
-            doc = html.fromstring(response.content)
-
-            date_time_info = doc.find('.//main[@data-analytics-race-date-time]')
-            self.doc = doc
-
-        self.race_info.course = date_time_info.attrib['data-analytics-coursename']
-
-        if 'belmont at the big a' in self.race_info.course.lower():
-            self.race_info.course_id = '255'
-            self.race_info.course = 'Aqueduct'
-        else:
-            self.race_info.course_id = url_split[4]
-
-        self.race_info.course_detail = find(
-            self.doc, 'span', 'rp-raceTimeCourseName_distanceDetail', property='class'
-        )
-
-        date_time = date_time_info.attrib['data-analytics-race-date-time']
-        self.race_info.off = parse_time(date_time)
-
-        self.race_info.date = convert_date(url_split[6])
-        self.race_info.region = get_region(self.race_info.course_id)
-        self.race_info.race_id = url_split[7]
-        self.race_info.going = find(
-            self.doc, 'span', 'rp-raceTimeCourseName_condition', property='class'
-        )
-        self.race_info.surface = get_surface(self.race_info.going)
-        self.race_info.race_name = find(self.doc, 'h2', 'rp-raceTimeCourseName__title', property='class')
-        self.race_info.race_class = find(
-            self.doc, 'span', 'rp-raceTimeCourseName_class', property='class'
-        ).strip('()')
-
-        self.race_info.pattern = self.get_race_pattern()
-
-        if self.race_info.race_class == '':
-            self.race_info.race_class = self.get_race_class()
-
-        self.race_info.race_name = clean_race(self.race_info.race_name)
-        self.race_info.age_band, self.race_info.rating_band = self.parse_race_bands()
-
-        self.race_info.sex_rest = self.sex_restricted()
-        (
-            self.race_info.dist,
-            self.race_info.dist_y,
-            self.race_info.dist_f,
-            self.race_info.dist_m,
-        ) = self.get_race_distances()
-
-        self.race_info.race_type = self.get_race_type(race_type)
-        self.race_info.ran = self.get_num_runners()
-
-        pedigree_info = self.doc.xpath("//tr[@data-test-selector='block-pedigreeInfoFullResults']/td")
-        pedigree = Pedigree(pedigree_info)
-
-        self.runner_info.sire_id = pedigree.id_sires
-        self.runner_info.sire = pedigree.sires
-        self.runner_info.dam_id = pedigree.id_dams
-        self.runner_info.dam = pedigree.dams
-        self.runner_info.damsire_id = pedigree.id_damsires
-        self.runner_info.damsire = pedigree.damsires
-        self.runner_info.sex = self.get_sexs(pedigree.pedigrees)
-        self.runner_info.comment = self.get_comments()
-        self.runner_info.pos = self.get_positions()
-        self.runner_info.prize = self.get_prizemoney()
-        self.runner_info.draw = self.get_draws()
-        self.runner_info.ovr_btn, self.runner_info.btn = self.get_distance_btn()
-        self.runner_info.sp = self.get_starting_prices()
-        self.runner_info.dec = self.get_decimal_odds()
-        self.runner_info.num = self.get_numbers()
-
-        self.race_info.ran = self.race_info.ran if self.race_info.ran else str(len(self.runner_info.num))
-
-        self.runner_info.age = self.get_horse_ages()
-        self.runner_info.horse = self.get_names_horse()
-        self.runner_info.horse_id = self.get_ids_horse()
-        self.runner_info.jockey = self.get_names_jockey()
-        self.runner_info.jockey_id = self.get_ids_jockey()
-        self.runner_info.trainer = self.get_names_trainer()
-        self.runner_info.trainer_id = self.get_ids_trainer()
-        self.runner_info.owner = self.get_names_owner()
-        self.runner_info.owner_id = self.get_ids_owner()
-        self.runner_info.hg = self.get_headgear()
-        self.runner_info.wgt, self.runner_info.lbs = self.get_weights()
-        self.runner_info.ofr = strip_row(self.doc.xpath('//td[@data-ending="OR"]/text()'))
-        self.runner_info.rpr = strip_row(self.doc.xpath('//td[@data-ending="RPR"]/text()'))
-        self.runner_info.ts = strip_row(self.doc.xpath('//td[@data-ending="TS"]/text()'))
-        self.runner_info.silk_url = self.doc.xpath('//img[@class="rp-horseTable__silk"]/@src')
-        self.runner_info.time = self.get_finishing_times()
-        self.runner_info.secs = self.time_to_seconds(self.runner_info.time)
-
+        self.build_race_info()
+        self.build_runners()
         self.clean_non_completions()
 
         if bsp_map:
             self.join_betfair_data(bsp_map)
 
         self.csv_data: list[str] = self.create_csv_data(fields)
+
+    def build_race_info(self) -> None:
+        header = self.data['header']
+        details = self.data['details']
+        info = self.race_info
+
+        info.date = self.data['raceDatetime'][:10]
+        info.course_id = str(self.data['courseUid'])
+        info.course = self.data['courseName']
+        info.region = get_region(info.course_id)
+        info.course_detail = ''
+
+        info.race_id = str(self.data['raceId'])
+        info.off = header.get('raceTime') or ''
+        info.race_name = header.get('raceTitle') or ''
+
+        info.going = header.get('going') or ''
+        info.surface = get_surface(info.going)
+
+        info.race_class = self.get_race_class(header.get('raceClass') or '')
+        info.pattern = self.get_race_pattern()
+
+        info.race_name = clean_race(info.race_name)
+
+        info.age_band, info.rating_band = self.parse_race_bands(
+            header.get('ratingBandAndAgesAllowed') or ''
+        )
+        info.sex_rest = self.sex_restricted()
+
+        (
+            info.dist,
+            info.dist_y,
+            info.dist_f,
+            info.dist_m,
+        ) = self.get_race_distances(header)
+
+        info.race_type = self.get_race_type(header.get('raceTypeCode') or '')
+        info.ran = str(details.get('numberOfRunners') or len(self.data['runners']))
+
+    def build_runners(self) -> None:
+        prizes = {
+            prize['position']: prize['formatted']
+            for prize in (self.data['header'].get('prizes') or [])
+        }
+
+        btn: list[str] = []
+        ovr_btn: list[str] = []
+
+        for runner in self.data['runners']:
+            pedigree = runner.get('pedigree') or {}
+            ri = self.runner_info
+
+            pos = self.get_position(runner)
+
+            ri.num.append(str(runner.get('saddleClothNo') or ''))
+            ri.pos.append(pos)
+            ri.draw.append((runner.get('drawLabel') or '').strip().strip('()'))
+            ri.horse_id.append(str(runner.get('horseUid') or ''))
+            ri.horse.append(self.name_with_region(runner.get('horseName'), runner.get('horseSuffix')))
+            ri.age.append(str(runner.get('age') or ''))
+            ri.sex.append(self.get_sex(pedigree))
+            ri.hg.append(self.get_headgear(runner))
+            ri.wgt.append(self.get_weight(runner))
+            ri.lbs.append(self.get_lbs(runner))
+            ri.sp.append((runner.get('odds') or '').replace('No Odds', '').strip())
+            ri.jockey_id.append(self.id_from_url(runner.get('jockeyUrl')))
+            ri.jockey.append(clean_string(runner.get('jockeyName') or ''))
+            ri.trainer_id.append(self.id_from_url(runner.get('trainerUrl')))
+            ri.trainer.append(clean_string(runner.get('trainerName') or ''))
+            ri.owner_id.append(self.id_from_url(runner.get('ownerUrl')))
+            ri.owner.append(clean_string(runner.get('ownerName') or ''))
+            ri.prize.append(self.get_prize(pos, prizes))
+            ri.ofr.append(self.get_rating(runner.get('officialRating')))
+            ri.rpr.append(self.get_rating(runner.get('rpRating')))
+            ri.ts.append(self.get_rating(runner.get('topspeed')))
+            ri.sire_id.append(self.id_from_url(pedigree.get('sireUrl')))
+            ri.sire.append(self.name_with_region(pedigree.get('sireName'), pedigree.get('sireSuffix')))
+            ri.dam_id.append(self.id_from_url(pedigree.get('damUrl')))
+            ri.dam.append(self.name_with_region(pedigree.get('damName'), pedigree.get('damSuffix')))
+            ri.damsire_id.append(self.id_from_url(pedigree.get('damSireUrl')))
+            ri.damsire.append(clean_string(pedigree.get('damSireName') or ''))
+            ri.silk_url.append(runner.get('silkUrl') or '')
+            ri.comment.append(self.get_comment(runner))
+
+            runner_btn, runner_ovr_btn = self.get_distances(runner, pos)
+            btn.append(runner_btn)
+            ovr_btn.append(runner_ovr_btn)
+
+        self.runner_info.dec = self.get_decimal_odds()
+        self.runner_info.btn = btn
+        self.runner_info.ovr_btn = ovr_btn
+        self.runner_info.time = self.get_finishing_times()
+        self.runner_info.secs = self.time_to_seconds(self.runner_info.time)
 
     def calculate_times(
         self, win_time: float, dist_btn: list[str], going: str, race_type: str
@@ -191,62 +194,37 @@ class Race:
             rows.append(race_prefix + ',' + ','.join(row) if race_prefix else ','.join(row))
         return rows
 
-    def get_comments(self):
-        def clean_comment(x: str):
-            return x.strip().replace('  ', '').replace(',', ' -').replace('\n', ' ').replace('\r', '')
+    def get_comment(self, runner: dict) -> str:
+        comment = (runner.get('comment') or {}).get('comment') or ''
+        return (
+            comment.strip()
+            .replace('  ', '')
+            .replace(',', ' -')
+            .replace('\n', ' ')
+            .replace('\r', '')
+        )
 
-        coms = self.doc.xpath("//tr[@class='rp-horseTable__commentRow ng-cloak']/td/text()")
-        return [clean_comment(com) for com in coms]
-
-    def get_decimal_odds(self):
+    def get_decimal_odds(self) -> list[str]:
         odds = [sub('(F|J|C)', '', sp) for sp in self.runner_info.sp]
         return fraction_to_decimal(odds)
 
-    def get_distance_btn(self) -> tuple[list[str], list[str]]:
-        btn: list[str] = []
-        ovr_btn: list[str] = []
+    def get_distances(self, runner: dict, pos: str) -> tuple[str, str]:
+        btn = runner.get('beatenDistance')
+        ovr_btn = runner.get('beatenDistanceToWinner')
 
-        for element in self.doc.xpath("//span[@class='rp-horseTable__pos__length']"):
-            distances: list[HtmlElement] = element.findall('span')
+        if btn is None:
+            btn = '0' if pos.isnumeric() else ''
+        else:
+            btn = distance_to_decimal(btn)
 
-            if len(distances) == 2:
-                btn.append(distances[0].text or '0')
-                ovr_btn.append((distances[1].text or '0').strip('[]'))
-            else:
-                text: str = distances[0].text or '0'
+        if ovr_btn is None:
+            ovr_btn = btn
+        else:
+            ovr_btn = distance_to_decimal(ovr_btn)
 
-                if text == 'dht':
-                    btn.append(text)
-                    ovr_btn.append(ovr_btn[-1] if ovr_btn else text)
-                else:
-                    btn.append(text)
-                    ovr_btn.append(text)
+        return btn, ovr_btn
 
-        try:
-            btn = [distance_to_decimal(b) for b in btn]
-        except AttributeError as e:
-            raise RuntimeError(
-                f'Failed to process btn distances for {getattr(self, "url", "unknown")}'
-            ) from e
-
-        ovr_btn = [distance_to_decimal(b) for b in ovr_btn]
-
-        num_runners: int = len(self.runner_info.pos)
-
-        if len(ovr_btn) < num_runners:
-            ovr_btn.extend('' for _ in range(num_runners - len(ovr_btn)))
-
-        if len(btn) < num_runners:
-            btn.extend('' for _ in range(num_runners - len(btn)))
-
-        return ovr_btn, btn
-
-    def get_draws(self) -> list[str]:
-        draws = self.doc.xpath("//sup[@class='rp-horseTable__pos__draw']/text()")
-        return [draw.replace('\xa0', ' ').strip().strip('()') for draw in draws]
-        # return self.doc.xpath("//span[@class='rp-horseTable__pos__draw']/@data-order-draw")
-
-    def get_finishing_times(self):
+    def get_finishing_times(self) -> list[str]:
         # adjust overall distance beaten when margins under a quarter length not accounted for
         # for instance when 2 horses finish with a head between them 4 lengths behind winner
         # both horses are recorded as being beaten 4 lengths overall by RP
@@ -274,95 +252,53 @@ class Race:
             self.race_info.race_type,
         )
 
-    def get_headgear(self) -> list[str]:
-        results: list[str] = []
-        for horse in self.doc.xpath("//td[contains(@class, 'rp-horseTable__wgt')]"):
-            hg = horse.find('.//span[@class="rp-horseTable__headGear"]')
-            if hg is None:
-                results.append('')
-                continue
+    def get_headgear(self, runner: dict) -> str:
+        headgear = runner.get('headgear')
 
-            if len(hg) > 1 and hg[1].text:
-                results.append((hg.text or '') + hg[1].text.strip())
-            else:
-                results.append(hg.text or '')
-        return results
+        if not headgear:
+            return ''
 
-    def get_horse_ages(self) -> list[str]:
-        ages = self.doc.xpath("//td[@data-test-selector='horse-age']/text()")
-        return [age.strip() for age in ages]
+        return headgear + ('1' if runner.get('isFirstTimeHeadgear') else '')
 
-    def get_ids_horse(self) -> list[str]:
-        horse_ids = self.doc.xpath("//a[@data-test-selector='link-horseName']/@href")
-        return [horse_id.split('/')[3] for horse_id in horse_ids]
+    def get_lbs(self, runner: dict) -> str:
+        lbs = runner.get('weightCarriedLbs')
 
-    def get_ids_jockey(self) -> list[str]:
-        jockey_ids = self.doc.xpath("//a[@data-test-selector='link-jockeyName']/@href")
-        return [jockey_id.split('/')[3] for jockey_id in jockey_ids[::2]]
+        if lbs is not None:
+            return str(lbs)
 
-    def get_ids_owner(self) -> list[str]:
-        owner_ids = self.doc.xpath("//a[@data-test-selector='link-silk']/@href")
-        return [owner_id.split('/')[3] for owner_id in owner_ids]
+        stones = runner.get('weightStones')
+        pounds = runner.get('weightPounds')
 
-    def get_ids_trainer(self) -> list[str]:
-        trainer_ids = self.doc.xpath("//a[@data-test-selector='link-trainerName']/@href")
-        return [trainer_id.split('/')[3] for trainer_id in trainer_ids[::2]]
+        if stones is None or pounds is None:
+            return ''
 
-    def get_names_horse(self) -> list[str]:
-        horses = self.doc.xpath("//a[@data-test-selector='link-horseName']/text()")
-        nationalities = self.get_nationalities()
-        return [f'{clean_string(horse)} {nat}' for horse, nat in zip(horses, nationalities)]
+        return str(int(stones) * 14 + int(pounds))
 
-    def get_names_jockey(self) -> list[str]:
-        jockeys = self.doc.xpath("//a[@data-test-selector='link-jockeyName']/text()")
-        return [clean_string(jock.strip()) for jock in jockeys[::3]]
+    def get_position(self, runner: dict) -> str:
+        if runner.get('isDisqualified'):
+            return 'DSQ'
 
-    def get_names_owner(self) -> list[str]:
-        owners = self.doc.xpath("//a[@data-test-selector='link-silk']/@href")
-        return [owner.split('/')[4].replace('-', ' ').title() for owner in owners]
+        return str(runner.get('outcomeCode') or '')
 
-    def get_names_trainer(self) -> list[str]:
-        trainers = self.doc.xpath("//a[@data-test-selector='link-trainerName']/text()")
-        return [clean_string(trainer.strip()) for trainer in trainers[::2][::2]]
+    def get_prize(self, pos: str, prizes: dict[int, str]) -> str:
+        if not pos.isnumeric():
+            return ''
 
-    def get_nationalities(self) -> list[str]:
-        nats = self.doc.xpath("//span[@class='rp-horseTable__horse__country']/text()")
-        return [(nat.strip() or '(GB)') for nat in nats]
+        prize = prizes.get(int(pos))
 
-    def get_num_runners(self) -> str:
-        ran = find(self.doc, 'span', 'rp-raceInfo__value rp-raceInfo__value_black')
-        return ran.replace('ran', '').strip()
+        if not prize:
+            return ''
 
-    def get_numbers(self) -> list[str]:
-        nums = self.doc.xpath("//span[@class='rp-horseTable__saddleClothNo']/text()")
-        return [num.strip('.') for num in nums]
+        return prize.replace('£', '').replace(',', '').strip()
 
-    def get_positions(self) -> list[str]:
-        positions = self.doc.xpath("//span[@data-test-selector='text-horsePosition']/text()")
-        del positions[1::2]
-        positions = [pos.strip() for pos in positions]
+    def get_rating(self, value: str | None) -> str:
+        rating = (value or '').strip()
+        return rating if rating.isdigit() else ''
 
-        if len(positions) > 0 and positions[0] == 'VOI':
-            raise VoidRaceError(f'VoidRaceError: {self.url}')
+    def get_race_class(self, code: str) -> str:
+        if code:
+            return f'Class {code}'
 
-        return positions
-
-    def get_prizemoney(self) -> list[str]:
-        prizes = self.doc.xpath("//div[@data-test-selector='text-prizeMoney']/text()")
-        prizes = [p.strip().replace(',', '').replace('£', '') for p in prizes]
-
-        if prizes:
-            prizes = prizes[1:]
-        else:
-            prizes = []
-
-        positions: list[str] = self.runner_info.pos
-
-        prizes.extend([''] * (len(positions) - len(prizes)))
-
-        return ['' if p == 'DSQ' else prize for p, prize in zip(positions, prizes)]
-
-    def get_race_class(self) -> str:
         classes = {
             'a': '1',
             'b': '2',
@@ -390,18 +326,17 @@ class Race:
 
         return ''
 
-    def get_race_distances(self) -> tuple[str, str, str, str]:
-        dist = find(self.doc, 'span', 'block-distanceInd')
-        dist_y = find(self.doc, 'span', 'block-fullDistanceInd').strip('()')
+    def get_race_distances(self, header: dict) -> tuple[str, str, str, str]:
+        dist = header.get('distanceShort') or ''
 
         try:
             dist_f = distance_to_furlongs(dist)
         except ValueError:
             print('ERROR: distance_to_furlongs()')
-            print('Race: ', self.url)
+            print('Race: ', self.data.get('raceId'))
             sys.exit()
 
-        dist_m = distance_to_metres(dist_y)
+        dist_m = distance_to_metres(header.get('distanceFull') or '')
 
         if dist_m == 0:
             dist_m = round(dist_f * 201.168)
@@ -430,112 +365,46 @@ class Race:
         return ''
 
     def get_race_type(self, code: str) -> str:
-        race_type = ''
-        race = self.race_info.race_name.lower()
+        return RACE_TYPE_CODES.get(code, 'Flat')
 
-        if code == 'flat' and 'national hunt flat' not in race:
-            race_type = 'Flat'
-        else:
-            fences = find(self.doc, 'span', 'rp-raceTimeCourseName_hurdles')
+    def get_sex(self, pedigree: dict) -> str:
+        parts = (pedigree.get('colourSex') or '').split()
 
-            if 'hurdle' in fences.lower():
-                race_type = 'Hurdle'
-            elif 'fence' in fences.lower():
-                race_type = 'Chase'
+        if not parts:
+            return ''
 
-        if race_type == '':
-            if int(self.race_info.dist_m) >= 2400:
-                if any(x in race for x in {'national hunt flat', 'nh flat race', 'mares flat race'}):
-                    race_type = 'NH Flat'
-                if any(
-                    x in race
-                    for x in {'inh bumper', ' sales bumper', 'kepak flat race', 'i.n.h. flat race'}
-                ):
-                    race_type = 'NH Flat'
-                if any(x in race for x in {' hurdle', '(hurdle)'}):
-                    race_type = 'Hurdle'
-                if any(
-                    x in race
-                    for x in {
-                        ' chase',
-                        '(chase)',
-                        'steeplechase',
-                        'steeple-chase',
-                        'steeplchase',
-                        'steepl-chase',
-                    }
-                ):
-                    race_type = 'Chase'
+        return parts[-1].upper()
 
-        if race_type == '':
-            race_type = 'Flat'
+    def get_weight(self, runner: dict) -> str:
+        stones = runner.get('weightStones')
+        pounds = runner.get('weightPounds')
 
-        return race_type
+        if stones is None or pounds is None:
+            return ''
 
-    def get_sexs(self, info: list[HtmlElement]) -> list[str]:
-        sexs: list[str] = []
-
-        for element in info:
-            text_parts = (element.text or '').strip().split()
-
-            if len(text_parts) == 1:
-                sexs.append(text_parts[0].upper())
-            elif len(text_parts) == 2:
-                sexs.append(text_parts[1].upper())
-            else:
-                raise ValueError(
-                    f'Unexpected sex format: {text_parts} (URL: {getattr(self, "url", "unknown")})'
-                )
-
-        return sexs
-
-    def get_starting_prices(self) -> list[str]:
-        sps = self.doc.xpath("//span[@class='rp-horseTable__horse__price']/text()")
-        return [sp.replace('No Odds', '').strip() for sp in sps]
-
-    def get_weights(self) -> tuple[list[str], list[str]]:
-        stones = self.doc.xpath("//span[@data-ending='st']/text()")
-        pounds = self.doc.xpath("//span[@data-ending='lb']/text()")
-
-        weights = [f'{s}-{p}' for s, p in zip(stones, pounds)]
-        lbs = [str(int(s) * 14 + int(p)) for s, p in zip(stones, pounds)]
-        wgt = [w.strip() for w in weights]
-
-        return wgt, lbs
+        return f'{stones}-{pounds}'
 
     def get_winning_time(self) -> float | None:
-        items = self.doc.xpath('//div[@class="rp-raceInfo"]/ul/li')
-        if not items:
-            raise ValueError(f'No race info found: {self.url}')
+        raw = (self.data['details'].get('winningTime') or '').strip()
 
-        spans = items[0].findall('.//span[@class="rp-raceInfo__value"]')
-        if len(spans) not in (2, 3):
-            raise ValueError(f'Unexpected number of time spans in {self.url}')
-
-        raw_text = spans[-2].text or ''
-        parts = raw_text.split('(')[0].split()
-
-        if parts and parts[0] in {'0.0.00s', '0.00s'}:
-            try:
-                fast_by = raw_text.split('(')[1].lower()
-                parts = fast_by.replace('fast by', '').strip(' )').split()
-            except IndexError:
-                return None
-
-        if not parts or parts == ['standard', 'time']:
+        if not raw:
             return None
 
-        try:
-            if len(parts) > 1:
-                minutes = float(parts[0].replace('m', ''))
-                seconds = float(parts[1].rstrip('s'))
-                total = minutes * 60 + seconds
-            else:
-                total = float(parts[0].rstrip('s'))
-        except ValueError as e:
-            raise ValueError(f'Invalid winning time in {self.url}: {parts}') from e
+        parts = raw.split()
 
-        return round(total, 2)
+        try:
+            if len(parts) == 2:
+                return round(float(parts[0].rstrip('m')) * 60 + float(parts[1].rstrip('s')), 2)
+            return round(float(parts[0].rstrip('s')), 2)
+        except ValueError:
+            return None
+
+    def id_from_url(self, url: str | None) -> str:
+        if not url:
+            return ''
+
+        parts = url.split('/')
+        return parts[3] if len(parts) > 3 else ''
 
     def join_betfair_data(self, bsp_map: BSPMap):
         key = (self.race_info.region, self.race_info.date, self.race_info.off)
@@ -559,8 +428,19 @@ class Race:
                     self.runner_info.ip_vol[i] = row.ip_vol or ''
                     break
 
-    def parse_race_bands(self) -> tuple[str, str]:
-        band = find(self.doc, 'span', 'rp-raceTimeCourseName_ratingBandAndAgesAllowed', property='class')
+    def name_with_region(self, name: str | None, region: str | None) -> str:
+        name = clean_string(name or '')
+
+        if not name:
+            return ''
+
+        region = (region or 'GB').strip()
+        if not region.startswith('('):
+            region = f'({region})'
+
+        return f'{name} {region}'
+
+    def parse_race_bands(self, band: str) -> tuple[str, str]:
         bands = band.strip('()').split(',')
 
         band_age = ''
@@ -600,14 +480,14 @@ class Race:
 
     def time_to_seconds(self, times: list[str]) -> list[str]:
         def convert_time(time_str: str) -> str:
-            if time_str == '-':
-                return '-'
+            if time_str in {'-', ''}:
+                return time_str
             try:
                 mins, secs = time_str.split(':')
                 total_seconds = (int(mins) * 60) + float(secs)
                 return f'{total_seconds:.2f}'
             except ValueError:
-                raise ValueError(f"Invalid time format: '{time_str}' from {self.url}")
+                raise ValueError(f"Invalid time format: '{time_str}' from {self.data.get('raceId')}")
 
         return [convert_time(t) for t in times]
 
@@ -677,8 +557,3 @@ def fraction_to_decimal(fractions: list[str]) -> list[str]:
             decimal.append(f'{float(num) / float(den) + 1.00:.2f}')
 
     return decimal
-
-
-def parse_time(date_time: str):
-    time = datetime.fromisoformat(date_time).time()
-    return f'{time.strftime("%H:%M")}'
