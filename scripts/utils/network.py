@@ -66,6 +66,6 @@ class NetworkClient:
                 return response.status_code, response
 
             if attempt < retries:
-                sleep(delay)
+                sleep(delay * attempt)
 
         raise Persistent406Error(f'received 406 for {retries} attempts on {url}')

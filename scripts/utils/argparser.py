@@ -31,6 +31,7 @@ class ParsedRequest(NamedTuple):
     years: list[str]
     tracks: list[tuple[str, str]]
     race_type: str
+    limit: int | None = None
 
 
 class ParsedArgs(NamedTuple):
@@ -70,6 +71,12 @@ class ArgParser:
             '--type',
             choices={'flat', 'jumps'},
             help='Race type',
+        )
+        _ = self.parser.add_argument(
+            '--limit',
+            type=int,
+            metavar='N',
+            help='Stop after N races this run (resume later with the same command)',
         )
         _ = self.parser.add_argument(
             '--date-file',
@@ -204,4 +211,5 @@ class ArgParser:
             years=years,
             tracks=tracks,
             race_type=race_type,
+            limit=args.limit,
         )

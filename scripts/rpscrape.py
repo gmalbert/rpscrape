@@ -9,12 +9,13 @@ from datetime import date
 from dotenv import load_dotenv
 from orjson import loads
 from pathlib import Path
+from time import sleep
 from typing import TextIO, TYPE_CHECKING
 from urllib.parse import urlencode
 
 from utils.argparser import ArgParser
 from utils.betfair import Betfair
-from utils.network import NetworkClient
+from utils.network import NetworkClient, Persistent406Error
 from utils.next_data import page_props, race_result
 from utils.paths import Paths, build_paths
 from utils.settings import Settings
@@ -31,6 +32,13 @@ RACE_TYPES: dict[str, set[str]] = {
     'flat': {'Flat'},
     'jumps': {'Chase', 'Hurdle', 'NH Flat'},
 }
+
+THROTTLE_ROUNDS = 5
+THROTTLE_DELAY = 60.0
+RACE_DELAY = 2.0
+CHUNK_SIZE = 250
+CHUNK_PAUSE = 120.0
+DISCOVERY_DELAY = 1.0
 
 
 def check_for_update() -> bool:
@@ -77,6 +85,7 @@ def get_race_urls(
             )
             url = f'{url_api_base}?{query}'
 
+            sleep(DISCOVERY_DELAY)
             status, response = client.get(url)
 
             if status != 200:
@@ -106,6 +115,7 @@ def get_race_urls_date(
     course_ids: set[str] = {t[0] for t in tracks}
 
     for race_date in dates:
+        sleep(DISCOVERY_DELAY)
         url = f'https://www.racingpost.com/results/{race_date}'
 
         _, response = client.get(url)
@@ -167,9 +177,18 @@ def prepare_betfair(
     return betfair
 
 
-def get_race_data(url: str, client: NetworkClient, retries: int = 3) -> dict | None:
-    for _ in range(retries):
-        _, response = client.get(url)
+def get_race_data(url: str, client: NetworkClient, retries: int = THROTTLE_ROUNDS) -> dict | None:
+    for attempt in range(retries):
+        try:
+            _, response = client.get(url)
+        except Persistent406Error:
+            if attempt == retries - 1:
+                raise
+
+            print(f'Throttled (406) on {url}, pausing {THROTTLE_DELAY:.0f}s')
+            sleep(THROTTLE_DELAY)
+            continue
+
         data = race_result(response.text)
 
         if data:
@@ -184,6 +203,7 @@ def scrape_races(
     race_type: str,
     client: NetworkClient,
     file_writer: Callable[[str, bool], TextIO],
+    limit: int | None = None,
 ):
     from utils.race import Race, VoidRaceError
 
@@ -209,7 +229,17 @@ def scrape_races(
         if not append:
             _ = f.write(settings.csv_header + '\n')
 
-        for url in race_urls:
+        for index, url in enumerate(race_urls, start=1):
+            if limit is not None and index > limit:
+                print(f'Reached limit of {limit} races; stopping (rerun to resume)')
+                break
+
+            sleep(RACE_DELAY)
+
+            if index % CHUNK_SIZE == 0:
+                print(f'Pausing {CHUNK_PAUSE:.0f}s after {index} races to avoid throttling')
+                sleep(CHUNK_PAUSE)
+
             data = get_race_data(url, client)
 
             try:
@@ -280,7 +310,7 @@ def main():
             lambda: get_race_urls(args.years, args.tracks, args.race_type, client),
         )
 
-    scrape_races(race_urls, paths, args.race_type, client, file_writer)
+    scrape_races(race_urls, paths, args.race_type, client, file_writer, limit=args.limit)
 
 
 if __name__ == '__main__':
