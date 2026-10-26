@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 from curl_cffi import Session, Response, BrowserTypeLiteral
+from os import getenv
 from random import choice
 from time import sleep
 from urllib.parse import quote
@@ -18,6 +19,18 @@ BROWSERS: Sequence[BrowserTypeLiteral] = (
 
 
 COGNITO_POOL = '3fii107m4bmtggnm21pud2es21'
+
+PROXY_ENV_VARS = ('RPS_PROXY', 'HTTPS_PROXY', 'https_proxy')
+
+
+def proxy_from_env() -> str | None:
+    for name in PROXY_ENV_VARS:
+        value = getenv(name)
+
+        if value:
+            return value
+
+    return None
 
 
 def construct_cookies(
@@ -42,11 +55,17 @@ class NetworkClient:
         auth_state: str | None = None,
         access_token: str | None = None,
         timeout: int = 14,
+        proxy: str | None = None,
     ) -> None:
         cookies = construct_cookies(email, auth_state, access_token)
+        proxy = proxy or proxy_from_env()
+        proxies = {'http': proxy, 'https': proxy} if proxy else None
 
-        self.session: Session = Session(impersonate=choice(BROWSERS), cookies=cookies)
+        self.session: Session = Session(
+            impersonate=choice(BROWSERS), cookies=cookies, proxies=proxies
+        )
         self.timeout: int = timeout
+        self.proxy: str | None = proxy
 
     def get(
         self,
